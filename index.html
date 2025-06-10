@@ -22,75 +22,78 @@
       justify-content: center;
     }
     .container { max-width: 600px; width: 100%; }
+
     .dropzone {
       border: 2px dashed var(--color-dashed);
       background: var(--color-bg-drop);
-      padding: 3rem;
-      text-align: center;
-      border-radius: 8px;
-      position: relative;
-      cursor: pointer;
-      transition: background .2s;
+      padding: 3rem; text-align: center;
+      border-radius: 8px; position: relative;
+      cursor: pointer; transition: background .2s;
     }
     .dropzone.hover { background: #e1e5f4; }
     .dropzone input {
       position: absolute; top:0; left:0; right:0; bottom:0;
       width:100%; height:100%; opacity:0; cursor:pointer;
     }
-    .dropzone .icon { font-size: 2.5rem; color: var(--color-primary); margin-bottom:1rem; }
+    .dropzone .icon { font-size:2.5rem; color:var(--color-primary); margin-bottom:1rem; }
     .dropzone .title { font-weight:bold; margin-bottom:.5rem; }
     .dropzone .subtitle { font-size:.9rem; color:#666; margin-bottom:1rem; }
     .dropzone button {
-      background: var(--color-primary);
-      color: #fff;
-      border: none;
-      padding: .5rem 1rem;
-      border-radius:4px;
-      cursor:pointer;
+      background:var(--color-primary); color:#fff;
+      border:none; padding:.5rem 1rem; border-radius:4px;
     }
 
-    .quality-group { margin: 2rem 0 1rem; }
-    .cards { display: flex; gap: 1rem; }
+    .quality-group { margin:2rem 0 1rem; }
+    .cards { display:flex; gap:1rem; }
     .card {
-      flex:1;
-      border:2px solid var(--color-card-border);
-      border-radius:6px;
-      padding:1rem;
-      text-align:center;
-      cursor:pointer;
-      transition:border-color .2s, background .2s;
+      flex:1; border:2px solid var(--color-card-border);
+      border-radius:6px; padding:1rem; text-align:center;
+      cursor:pointer; transition:border-color .2s,background .2s;
     }
     .card.selected {
-      border-color: var(--color-primary);
-      background: rgba(194,190,80, .1);
+      border-color:var(--color-primary);
+      background:rgba(194,190,80,.1);
     }
-    .card h4 { margin-bottom:.5rem; }
-    .card p { font-size:.85rem; color:#555; }
+    .card h4{margin-bottom:.5rem;}
+    .card p{font-size:.85rem;color:#555;}
 
     .compress-btn {
-      width:100%;
-      padding:.75rem;
-      background: var(--color-primary);
-      color: #fff;
+      width:100%; padding:.75rem; margin-top:1.5rem;
+      background:var(--color-primary); color:#fff;
       border:2px solid var(--color-primary);
-      border-radius:4px;
-      font-size:1rem;
-      cursor:pointer;
-      margin-top:1.5rem;
+      border-radius:4px; font-size:1rem; cursor:pointer;
     }
-    .compress-btn:hover { opacity:.9; }
+    .compress-btn:hover{opacity:.9;}
+
+    /* Progress bars */
+    .progress-container {
+      margin-top:1rem;
+    }
+    .progress-label {
+      font-size:.85rem; margin-bottom:.25rem;
+    }
+    .progress-bar {
+      width:100%; height:8px; background:#eee; border-radius:4px;
+      overflow:hidden; margin-bottom:1rem;
+    }
+    .progress-fill {
+      width:0; height:100%; background:var(--color-primary);
+      transition: width .2s;
+    }
   </style>
 </head>
 <body>
   <div class="container">
+    <!-- Upload zone -->
     <div class="dropzone" id="dropzone">
       <div class="icon">☁️⬆️</div>
       <div class="title">Upload Your Video</div>
-      <div class="subtitle">Drag & drop your video file here or click to browse</div>
+      <div class="subtitle">Drag & drop or click to browse</div>
       <button type="button">Browse Files</button>
       <input type="file" id="videoFile" accept=".mp4,.mov">
     </div>
 
+    <!-- Quality cards -->
     <div class="quality-group">
       <h3>Select Compression Quality</h3>
       <div class="cards">
@@ -105,31 +108,90 @@
       </div>
     </div>
 
+    <!-- Compress button -->
     <button class="compress-btn" id="compressBtn">Compress Video</button>
+
+    <!-- Progress bars -->
+    <div class="progress-container">
+      <div class="progress-label">Upload Progress</div>
+      <div class="progress-bar"><div id="uploadFill" class="progress-fill"></div></div>
+      <div class="progress-label">Download Progress</div>
+      <div class="progress-bar"><div id="downloadFill" class="progress-fill"></div></div>
+    </div>
   </div>
 
   <script>
     const dz = document.getElementById('dropzone');
-    dz.addEventListener('dragover', e=>{ e.preventDefault(); dz.classList.add('hover'); });
-    dz.addEventListener('dragleave', ()=>dz.classList.remove('hover'));
-    dz.addEventListener('drop', e=>{
+    const fileInput = document.getElementById('videoFile');
+    const cards = document.querySelectorAll('.card');
+    const compressBtn = document.getElementById('compressBtn');
+    const uploadFill = document.getElementById('uploadFill');
+    const downloadFill = document.getElementById('downloadFill');
+
+    // Dropzone handlers
+    dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('hover'); });
+    dz.addEventListener('dragleave', () => dz.classList.remove('hover'));
+    dz.addEventListener('drop', e => {
       e.preventDefault(); dz.classList.remove('hover');
-      if(e.dataTransfer.files[0]) document.getElementById('videoFile').files = e.dataTransfer.files;
+      if (e.dataTransfer.files[0]) fileInput.files = e.dataTransfer.files;
     });
+    dz.querySelector('button').addEventListener('click', ()=> fileInput.click());
 
-    document.querySelectorAll('.card').forEach(c=>{
-      c.addEventListener('click', ()=>{
-        document.querySelectorAll('.card').forEach(x=>x.classList.remove('selected'));
-        c.classList.add('selected');
-      });
-    });
+    // Quality card toggle
+    cards.forEach(c => c.addEventListener('click', ()=>{
+      cards.forEach(x=>x.classList.remove('selected'));
+      c.classList.add('selected');
+    }));
 
-    document.getElementById('compressBtn').addEventListener('click', ()=>{
-      const fi = document.getElementById('videoFile');
-      if(!fi.files.length) return alert('Please select a video first.');
+    compressBtn.addEventListener('click', () => {
+      if (!fileInput.files.length) return alert('Please select a video first.');
+      const file = fileInput.files[0];
       const quality = document.querySelector('.card.selected').dataset.quality;
-      // Replace URL below with your backend endpoint:
-      alert(`Would upload ${fi.files[0].name} at ${quality} quality`);
+
+      // Build form data
+      const formData = new FormData();
+      formData.append('video', file);
+      formData.append('quality', quality);
+
+      // Reset progress bars
+      uploadFill.style.width = '0%';
+      downloadFill.style.width = '0%';
+
+      // Upload via XHR to track upload progress
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/compress');  // replace with your backend URL
+
+      xhr.upload.onprogress = e => {
+        if (e.lengthComputable) {
+          const pct = (e.loaded / e.total * 100).toFixed(1);
+          uploadFill.style.width = pct + '%';
+        }
+      };
+
+      xhr.responseType = 'blob';
+      xhr.onprogress = e => {
+        // e.loaded here is bytes downloaded so far
+        const ct = xhr.getResponseHeader('Content-Length');
+        if (ct) {
+          const pct = (e.loaded / ct * 100).toFixed(1);
+          downloadFill.style.width = pct + '%';
+        }
+      };
+
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          const blob = xhr.response;
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          a.download = `compressed_${quality}.${file.name.split('.').pop()}`;
+          a.click();
+        } else {
+          alert('Compression failed: ' + xhr.statusText);
+        }
+      };
+
+      xhr.onerror = () => alert('Network error during upload.');
+      xhr.send(formData);
     });
   </script>
 </body>
