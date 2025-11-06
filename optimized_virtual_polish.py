@@ -16,7 +16,7 @@ DEFAULT_MODEL = r"C:\\Users\\M.I TECH\\Desktop\\final\\nails_seg_s_yolov8_v1_flo
 TARGET_CAM = 0
 DISPLAY_WINDOW = "Virtual Nail Polish. Press Q to quit."
 DESIRED_FPS = 25             # UI/display FPS (what you see)
-INFER_FPS = 12               # how often we actually run inference (lower = faster/less CPU)
+INFER_FPS = 15               # how often we actually run inference (lower = faster/less CPU)
 TFLITE_THREADS = max(1, multiprocessing.cpu_count() - 1)
 NAIL_COLOR = (199, 21, 133)  # fallback RGB
 TEXTURE_DEFAULT = 0.35
@@ -263,9 +263,11 @@ class InferenceWorker(threading.Thread):
         while self.running:
             try:
                 now = time.time()
-                if self.infer_fps > 0 and (now - last_inf) < (1.0 / self.infer_fps):
-                    time.sleep(0.005)
-                    continue
+                if self.infer_fps > 0:
+                    wait = (1.0 / self.infer_fps) - (now - last_inf)
+                    if wait > 0:
+                        time.sleep(min(wait, 0.002))
+                        continue
                 try:
                     frame = self.in_q.get(timeout=0.1)
                 except queue.Empty:
@@ -353,9 +355,6 @@ class InferenceWorker(threading.Thread):
                             combined_mask_in.fill(0)
                             for idx in range(mask_stack.shape[-1]):
                                 mask = mask_stack[:, :, idx]
-                                mask_in = cv2.resize((mask * 255.0).astype(np.uint8),
-                                                     (self.in_w, self.in_h),
-                                                     interpolation=cv2.INTER_LINEAR)
 
                                 cx, cy, bw, bh = boxes[idx]
                                 if cx > 1.5 or cy > 1.5 or bw > 1.5 or bh > 1.5:
@@ -372,15 +371,21 @@ class InferenceWorker(threading.Thread):
                                 x1, y1 = max(0, x1), max(0, y1)
                                 x2, y2 = min(self.in_w, x2), min(self.in_h, y2)
 
-                                if x2 > x1 and y2 > y1:
-                                    roi = mask_in[y1:y2, x1:x2]
-                                    if roi.size:
-                                        np.maximum(
-                                            combined_mask_in[y1:y2, x1:x2],
-                                            roi,
-                                            out=combined_mask_in[y1:y2, x1:x2]
-                                        )
+                                w = x2 - x1
+                                h = y2 - y1
+
+                                if w > 0 and h > 0:
+                                    mask_roi = cv2.resize(mask, (w, h), interpolation=cv2.INTER_LINEAR)
+                                    mask_roi_u8 = (mask_roi * 255.0).astype(np.uint8, copy=False)
+                                    np.maximum(
+                                        combined_mask_in[y1:y2, x1:x2],
+                                        mask_roi_u8,
+                                        out=combined_mask_in[y1:y2, x1:x2]
+                                    )
                                 else:
+                                    mask_in = cv2.resize((mask * 255.0).astype(np.uint8),
+                                                         (self.in_w, self.in_h),
+                                                         interpolation=cv2.INTER_LINEAR)
                                     np.maximum(combined_mask_in, mask_in, out=combined_mask_in)
 
                             if combined_mask_in.any():
@@ -392,7 +397,7 @@ class InferenceWorker(threading.Thread):
                 self._build_fallback_mask(outputs, H, W, combined_mask)
 
             if not combined_mask.any():
-                final_bgr = frame.copy()
+                final_bgr = frame
                 proc_dt = time.time() - ts0
             else:
                 small_w = max(8, int(W * self.mask_downscale))
@@ -478,6 +483,8 @@ class InferenceWorker(threading.Thread):
                 mask_resized = cv2.resize(mask_uint8, (W, H), interpolation=cv2.INTER_LINEAR)
                 _, m_bin = cv2.threshold(mask_resized, 127, 255, cv2.THRESH_BINARY)
                 np.maximum(out_mask, m_bin, out=out_mask)
+                if out_mask.any():
+                    return out_mask
         return out_mask
 
 
