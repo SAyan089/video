@@ -16,7 +16,7 @@ DEFAULT_MODEL = r"C:\\Users\\M.I TECH\\Desktop\\final\\nails_seg_s_yolov8_v1_flo
 TARGET_CAM = 0
 DISPLAY_WINDOW = "Virtual Nail Polish. Press Q to quit."
 DESIRED_FPS = 25             # UI/display FPS (what you see)
-INFER_FPS = 8                # how often we actually run inference (lower = faster/less CPU)
+INFER_FPS = 12               # how often we actually run inference (lower = faster/less CPU)
 TFLITE_THREADS = max(1, multiprocessing.cpu_count() - 1)
 NAIL_COLOR = (199, 21, 133)  # fallback RGB
 TEXTURE_DEFAULT = 0.35
@@ -103,11 +103,11 @@ def create_feathered_alpha(mask, inner_feather=3, outer_feather=6, max_out_alpha
     return np.clip(alpha, 0.0, 1.0).astype(np.float32)
 
 
-def colorize_nail_texture(orig_rgb, alpha, color_rgb, texture_strength=0.35, brightness_adjust=1.0):
-    img_f = orig_rgb.astype(np.float32) * brightness_adjust
-    gray = cv2.cvtColor(orig_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+def colorize_nail_texture(orig_bgr, alpha, color_rgb, texture_strength=0.35, brightness_adjust=1.0):
+    img_f = orig_bgr.astype(np.float32) * brightness_adjust
+    gray = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
     highlights = np.sqrt(gray)
-    color = np.asarray(color_rgb, dtype=np.float32).reshape(1, 1, 3)
+    color = np.asarray((color_rgb[2], color_rgb[1], color_rgb[0]), dtype=np.float32).reshape(1, 1, 3)
     colored_layer = img_f * texture_strength + color * (1.0 - texture_strength)
     highlight_boost = highlights[:, :, None] * 0.2
     colored_layer = colored_layer * (1 + highlight_boost)
@@ -229,6 +229,7 @@ class InferenceWorker(threading.Thread):
         else:
             self.input_tensor = np.empty(input_shape, dtype=np.float32)
             self._float_buffer = np.empty((self.in_h, self.in_w, input_shape[3]), dtype=np.float32)
+        self._rgb_resize_buffer = np.empty((self.in_h, self.in_w, input_shape[3]), dtype=np.uint8)
 
         self.det_idx = None
         self.proto_idx = None
@@ -271,13 +272,13 @@ class InferenceWorker(threading.Thread):
                     continue
 
                 ts0 = time.time()
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                resized = cv2.resize(frame_rgb, (self.in_w, self.in_h), interpolation=cv2.INTER_LINEAR)
+                resized_bgr = cv2.resize(frame, (self.in_w, self.in_h), interpolation=cv2.INTER_LINEAR)
                 if self.input_dtype == np.uint8:
-                    np.copyto(self.input_tensor[0], resized, casting='unsafe')
+                    cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2RGB, dst=self.input_tensor[0])
                 else:
-                    self._float_buffer[...] = resized
+                    cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2RGB, dst=self._rgb_resize_buffer)
+                    self._float_buffer[...] = self._rgb_resize_buffer
                     self._float_buffer *= 1.0 / 255.0
                     np.copyto(self.input_tensor[0], self._float_buffer)
 
@@ -390,61 +391,59 @@ class InferenceWorker(threading.Thread):
             if not combined_mask.any():
                 self._build_fallback_mask(outputs, H, W, combined_mask)
 
-                if not combined_mask.any():
-                    final_rgb = frame_rgb
-                    final_bgr = frame
-                    proc_dt = time.time() - ts0
+            if not combined_mask.any():
+                final_bgr = frame.copy()
+                proc_dt = time.time() - ts0
+            else:
+                small_w = max(8, int(W * self.mask_downscale))
+                small_h = max(8, int(H * self.mask_downscale))
+                small_mask = cv2.resize(combined_mask, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
+                _, small_mask = cv2.threshold(small_mask, 127, 255, cv2.THRESH_BINARY)
+
+                refined_small = refine_nail_mask(
+                    small_mask,
+                    min_area=self._min_area_scaled,
+                    kernel=_SMALL_KERNEL
+                )
+                refined_small = cv2.dilate(refined_small, self._dilate_kernel, iterations=1)
+
+                alpha_small = create_feathered_alpha(
+                    refined_small,
+                    inner_feather=self._inner_feather,
+                    outer_feather=self._outer_feather,
+                    max_out_alpha=MAX_OUT_ALPHA
+                )
+
+                alpha_map = cv2.resize(alpha_small, (W, H), interpolation=cv2.INTER_LINEAR)
+
+                colored = colorize_nail_texture(
+                    frame,
+                    alpha_map,
+                    InferenceWorker.shared_color_rgb,
+                    texture_strength=InferenceWorker.shared_texture,
+                    brightness_adjust=1.05
+                )
+
+                if InferenceWorker.shared_sheen:
+                    refined_up = cv2.resize(refined_small, (W, H), interpolation=cv2.INTER_NEAREST)
+                    final_bgr = add_natural_sheen(
+                        colored,
+                        refined_up,
+                        intensity=InferenceWorker.shared_sheen_intensity
+                    )
                 else:
-                    small_w = max(8, int(W * self.mask_downscale))
-                    small_h = max(8, int(H * self.mask_downscale))
-                    small_mask = cv2.resize(combined_mask, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
-                    _, small_mask = cv2.threshold(small_mask, 127, 255, cv2.THRESH_BINARY)
+                    final_bgr = colored
 
-                    refined_small = refine_nail_mask(
-                        small_mask,
-                        min_area=self._min_area_scaled,
-                        kernel=_SMALL_KERNEL
-                    )
-                    refined_small = cv2.dilate(refined_small, self._dilate_kernel, iterations=1)
+                proc_dt = time.time() - ts0
 
-                    alpha_small = create_feathered_alpha(
-                        refined_small,
-                        inner_feather=self._inner_feather,
-                        outer_feather=self._outer_feather,
-                        max_out_alpha=MAX_OUT_ALPHA
-                    )
-
-                    alpha_map = cv2.resize(alpha_small, (W, H), interpolation=cv2.INTER_LINEAR)
-
-                    colored = colorize_nail_texture(
-                        frame_rgb,
-                        alpha_map,
-                        InferenceWorker.shared_color_rgb,
-                        texture_strength=InferenceWorker.shared_texture,
-                        brightness_adjust=1.05
-                    )
-
-                    if InferenceWorker.shared_sheen:
-                        refined_up = cv2.resize(refined_small, (W, H), interpolation=cv2.INTER_NEAREST)
-                        final_rgb = add_natural_sheen(
-                            colored,
-                            refined_up,
-                            intensity=InferenceWorker.shared_sheen_intensity
-                        )
-                    else:
-                        final_rgb = colored
-
-                    final_bgr = cv2.cvtColor(final_rgb, cv2.COLOR_RGB2BGR)
-                    proc_dt = time.time() - ts0
-
-                with self.out_lock:
-                    self.latest_result = {
-                        'bgr': final_bgr,
-                        'ts': time.time(),
-                        'inf_dt': inf_dt,
-                        'proc_dt': proc_dt
-                    }
-                last_inf = time.time()
+            with self.out_lock:
+                self.latest_result = {
+                    'bgr': final_bgr,
+                    'ts': time.time(),
+                    'inf_dt': inf_dt,
+                    'proc_dt': proc_dt
+                }
+            last_inf = time.time()
             except Exception as exc:
                 print("Worker error:", exc)
                 traceback.print_exc()
