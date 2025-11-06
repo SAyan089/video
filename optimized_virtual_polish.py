@@ -240,6 +240,9 @@ class InferenceWorker(threading.Thread):
         self._inner_feather = max(1, int(FEATHER_IN * self.mask_downscale))
         self._outer_feather = max(1, int(FEATHER_OUT * self.mask_downscale))
         self._min_area_scaled = max(30, int(MIN_CONTOUR * (self.mask_downscale ** 2)))
+        self._mask_logits = None
+        self._mask_workspace = np.zeros((self.in_h, self.in_w), dtype=np.uint8)
+        self._full_mask_buffer = None
 
     def submit(self, frame_bgr):
         if frame_bgr is None:
@@ -289,7 +292,11 @@ class InferenceWorker(threading.Thread):
                 )
 
                 H, W = frame.shape[:2]
-                combined_mask = np.zeros((H, W), dtype=np.uint8)
+                if self._full_mask_buffer is None or self._full_mask_buffer.shape != (H, W):
+                    self._full_mask_buffer = np.zeros((H, W), dtype=np.uint8)
+                else:
+                    self._full_mask_buffer.fill(0)
+                combined_mask = self._full_mask_buffer
 
                 if self.proto_idx is not None and self.det_idx is not None:
                     proto = outputs[self.proto_idx]
@@ -307,6 +314,8 @@ class InferenceWorker(threading.Thread):
                         det = det.transpose(1, 0)
 
                     if proto is not None and det.ndim == 2:
+                        proto = np.asarray(proto, dtype=np.float32)
+                        det = np.asarray(det, dtype=np.float32)
                         P = proto.shape[-1]
                         cols = det.shape[1]
                         if cols >= 5 + P:
@@ -325,11 +334,22 @@ class InferenceWorker(threading.Thread):
 
                             ph, pw, _ = proto.shape
                             proto_flat = proto.reshape(-1, P)
-                            mask_logits = proto_flat @ mask_coeffs.T
-                            mask_stack = 1.0 / (1.0 + np.exp(-mask_logits))
-                            mask_stack = mask_stack.reshape(ph, pw, -1)
+                            rows = proto_flat.shape[0]
+                            cols_valid = mask_coeffs.shape[0]
+                            mask_coeffs = np.ascontiguousarray(mask_coeffs, dtype=np.float32)
 
-                            combined_mask_in = np.zeros((self.in_h, self.in_w), dtype=np.uint8)
+                            if self._mask_logits is None or self._mask_logits.shape != (rows, cols_valid):
+                                self._mask_logits = np.empty((rows, cols_valid), dtype=np.float32)
+
+                            np.dot(proto_flat, mask_coeffs.T, out=self._mask_logits)
+                            np.negative(self._mask_logits, out=self._mask_logits)
+                            np.exp(self._mask_logits, out=self._mask_logits)
+                            self._mask_logits += 1.0
+                            np.reciprocal(self._mask_logits, out=self._mask_logits)
+                            mask_stack = self._mask_logits.reshape(ph, pw, cols_valid)
+
+                            combined_mask_in = self._mask_workspace
+                            combined_mask_in.fill(0)
                             for idx in range(mask_stack.shape[-1]):
                                 mask = mask_stack[:, :, idx]
                                 mask_in = cv2.resize((mask * 255.0).astype(np.uint8),
@@ -354,21 +374,25 @@ class InferenceWorker(threading.Thread):
                                 if x2 > x1 and y2 > y1:
                                     roi = mask_in[y1:y2, x1:x2]
                                     if roi.size:
-                                        combined_mask_in[y1:y2, x1:x2] = np.maximum(
-                                            combined_mask_in[y1:y2, x1:x2], roi
+                                        np.maximum(
+                                            combined_mask_in[y1:y2, x1:x2],
+                                            roi,
+                                            out=combined_mask_in[y1:y2, x1:x2]
                                         )
                                 else:
-                                    combined_mask_in = np.maximum(combined_mask_in, mask_in)
+                                    np.maximum(combined_mask_in, mask_in, out=combined_mask_in)
 
                             if combined_mask_in.any():
                                 mask_full = cv2.resize(combined_mask_in, (W, H), interpolation=cv2.INTER_LINEAR)
-                                _, combined_mask = cv2.threshold(mask_full, 127, 255, cv2.THRESH_BINARY)
+                                _, mask_bin = cv2.threshold(mask_full, 127, 255, cv2.THRESH_BINARY)
+                                np.copyto(combined_mask, mask_bin)
 
-                if not combined_mask.any():
-                    combined_mask = self._build_fallback_mask(outputs, H, W)
+            if not combined_mask.any():
+                self._build_fallback_mask(outputs, H, W, combined_mask)
 
                 if not combined_mask.any():
                     final_rgb = frame_rgb
+                    final_bgr = frame
                     proc_dt = time.time() - ts0
                 else:
                     small_w = max(8, int(W * self.mask_downscale))
@@ -410,11 +434,12 @@ class InferenceWorker(threading.Thread):
                     else:
                         final_rgb = colored
 
+                    final_bgr = cv2.cvtColor(final_rgb, cv2.COLOR_RGB2BGR)
                     proc_dt = time.time() - ts0
 
                 with self.out_lock:
                     self.latest_result = {
-                        'rgb': final_rgb,
+                        'bgr': final_bgr,
                         'ts': time.time(),
                         'inf_dt': inf_dt,
                         'proc_dt': proc_dt
@@ -432,8 +457,8 @@ class InferenceWorker(threading.Thread):
     def stop(self):
         self.running = False
 
-    def _build_fallback_mask(self, outputs, H, W):
-        combined = np.zeros((H, W), dtype=np.uint8)
+    def _build_fallback_mask(self, outputs, H, W, out_mask):
+        out_mask.fill(0)
         for idx, o in enumerate(outputs):
             if idx in (self.proto_idx, self.det_idx):
                 continue
@@ -453,8 +478,8 @@ class InferenceWorker(threading.Thread):
                 mask_uint8 = (np.clip(mask, 0.0, 1.0) * 255.0).astype(np.uint8)
                 mask_resized = cv2.resize(mask_uint8, (W, H), interpolation=cv2.INTER_LINEAR)
                 _, m_bin = cv2.threshold(mask_resized, 127, 255, cv2.THRESH_BINARY)
-                combined = np.maximum(combined, m_bin)
-        return combined
+                np.maximum(out_mask, m_bin, out=out_mask)
+        return out_mask
 
 
 def parse_tflite_outputs(outputs):
@@ -531,6 +556,7 @@ def run_live(model_path, cam_index=0, desired_fps=DESIRED_FPS, color_hex="#c7158
     print("Model loaded. Starting camera. Press Q to quit.")
     last_time = time.time()
     fps_avg = 0.0
+    display_surface = None
     try:
         while True:
             start = time.time()
@@ -539,15 +565,12 @@ def run_live(model_path, cam_index=0, desired_fps=DESIRED_FPS, color_hex="#c7158
 
             if ok and frame is not None:
                 worker.submit(frame)
-                if latest is not None:
-                    display_rgb = latest['rgb']
-                else:
-                    display_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                base_bgr = latest['bgr'] if latest is not None else frame
             else:
                 if latest is None:
                     time.sleep(0.005)
                     continue
-                display_rgb = latest['rgb']
+                base_bgr = latest['bgr']
 
             now = time.time()
             dt = now - last_time
@@ -562,7 +585,10 @@ def run_live(model_path, cam_index=0, desired_fps=DESIRED_FPS, color_hex="#c7158
                 inf_ms = latest.get('inf_dt', 0.0) * 1000.0
                 status = f"INF {inf_ms:.0f}ms PRC {proc_ms:.0f}ms"
 
-            disp_bgr = cv2.cvtColor(display_rgb, cv2.COLOR_RGB2BGR)
+            if display_surface is None or display_surface.shape != base_bgr.shape:
+                display_surface = np.empty_like(base_bgr)
+            np.copyto(display_surface, base_bgr)
+            disp_bgr = display_surface
             cv2.putText(disp_bgr, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             cv2.putText(disp_bgr, status, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
             cv2.imshow(DISPLAY_WINDOW, disp_bgr)
