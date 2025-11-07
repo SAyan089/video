@@ -436,7 +436,16 @@ class InferenceWorker(threading.Thread):
                 proto = proto[0]
             elif proto.ndim == 3 and proto.shape[0] == 1:
                 proto = proto[0]
-            if proto.ndim != 3:
+
+            if proto.ndim == 3:
+                # ensure proto is (H, W, C)
+                if proto.shape[-1] <= 256:
+                    pass  # already channel-last
+                elif proto.shape[0] <= 256:
+                    proto = np.transpose(proto, (1, 2, 0))
+                else:
+                    proto = None
+            else:
                 proto = None
 
             det = outputs[self.det_idx]
