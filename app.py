@@ -21,10 +21,13 @@ TFLITE_THREADS = max(1, multiprocessing.cpu_count() - 1)
 NAIL_COLOR = (199, 21, 133)
 NAIL_COLOR_BGR = NAIL_COLOR[::-1]
 TEXTURE_DEFAULT = 0.35
-DILATION_PIXELS = 4
+FEATHER_IN = 2
+FEATHER_OUT = 4
+MAX_OUT_ALPHA = 0.06
+DILATION_PIXELS = 3
 MASK_DOWNSCALE = 0.5
 DELEGATE_MODE = "auto"
-MAX_ACTIVE_MASKS = 10
+MAX_ACTIVE_MASKS = 8
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CAMERA_FPS = 60
@@ -39,6 +42,30 @@ except AttributeError:
 
 
 # ---------------- Helper functions ----------------
+def create_feathered_alpha(mask_small):
+    mask_norm = mask_small.astype(np.float32) / 255.0
+    if FEATHER_IN > 0:
+        inner = cv2.erode(
+            mask_norm,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(1, FEATHER_IN * 2 + 1),) * 2),
+            iterations=1,
+        )
+        mask_norm = np.maximum(mask_norm, inner * 0.9 + 0.1)
+    if FEATHER_OUT > 0:
+        outer = cv2.dilate(
+            mask_norm,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(1, FEATHER_OUT * 2 + 1),) * 2),
+            iterations=1,
+        )
+        blend = np.clip(outer, 0.0, 1.0) * MAX_OUT_ALPHA
+        mask_norm = np.where(mask_norm > 0, mask_norm, blend)
+    blur_k = max(3, FEATHER_OUT * 2 + 3)
+    if blur_k % 2 == 0:
+        blur_k += 1
+    alpha = cv2.GaussianBlur(mask_norm, (blur_k, blur_k), 0)
+    return np.clip(alpha, 0.0, 1.0).astype(np.float32)
+
+
 def colorize_nail_texture(orig_bgr, alpha, color_bgr, texture_strength=0.35, brightness_adjust=1.05):
     img_f = orig_bgr.astype(np.float32) * brightness_adjust
     color = np.asarray(color_bgr, dtype=np.float32).reshape(1, 1, 3)
@@ -242,46 +269,37 @@ class InferenceWorker(threading.Thread):
         self.proto_idx = None
 
         self._dilate_kernel = None
-        self._blur_kernel = None
-        self._blur_sigma = None
+        self._alpha_kernel_in = None
+        self._alpha_kernel_out = None
         self._alpha_cache_mask = None
         self._alpha_cache = None
 
-        self._prev_gray_small = None
-        self._motion_threshold = 6.5
-
     def _ensure_cached_params(self, small_h, small_w):
-        dilate = max(1, int(self.mask_downscale * DILATION_PIXELS * 2))
-        if dilate % 2 == 0:
-            dilate += 1
+        dilate = max(1, int(self.mask_downscale * DILATION_PIXELS * 2) | 1)
         self._dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate, dilate))
-
-        blur = max(3, int(self.mask_downscale * 26))
-        if blur % 2 == 0:
-            blur += 1
-        self._blur_kernel = (blur, blur)
-        self._blur_sigma = max(0.5, self.mask_downscale * 9.0)
-
+        if FEATHER_IN > 0:
+            self._alpha_kernel_in = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (max(1, FEATHER_IN * 2 + 1),) * 2
+            )
+        if FEATHER_OUT > 0:
+            self._alpha_kernel_out = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (max(1, FEATHER_OUT * 2 + 1),) * 2
+            )
         if self._alpha_cache_mask is not None and self._alpha_cache_mask.shape != (small_h, small_w):
             self._alpha_cache_mask = None
             self._alpha_cache = None
 
     def _alpha_for(self, mask_small):
-        if self._alpha_cache_mask is not None:
-            if self._alpha_cache_mask.shape != mask_small.shape:
-                self._alpha_cache_mask = None
-                self._alpha_cache = None
+        if self._alpha_cache_mask is not None and self._alpha_cache_mask.shape != mask_small.shape:
+            self._alpha_cache_mask = None
+            self._alpha_cache = None
 
         if self._alpha_cache_mask is not None:
             diff = cv2.countNonZero(cv2.bitwise_xor(self._alpha_cache_mask, mask_small))
             if diff <= mask_small.size * ALPHA_CACHE_THRESHOLD:
                 return self._alpha_cache
 
-        mask_norm = mask_small.astype(np.float32) / 255.0
-        if self._dilate_kernel is not None:
-            mask_norm = cv2.dilate(mask_norm, self._dilate_kernel, iterations=1)
-        alpha = cv2.GaussianBlur(mask_norm, self._blur_kernel, self._blur_sigma)
-        alpha = np.clip(alpha, 0.0, 1.0).astype(np.float32)
+        alpha = create_feathered_alpha(mask_small)
         self._alpha_cache_mask = mask_small.copy()
         self._alpha_cache = alpha
         return alpha
@@ -298,15 +316,6 @@ class InferenceWorker(threading.Thread):
             self.in_q.put_nowait(frame_bgr)
         except queue.Full:
             pass
-
-    def _motion_gate(self, frame_small_gray):
-        if self._prev_gray_small is None:
-            self._prev_gray_small = frame_small_gray
-            return True
-        diff = cv2.absdiff(self._prev_gray_small, frame_small_gray)
-        mean_diff = float(diff.mean())
-        self._prev_gray_small = frame_small_gray
-        return mean_diff > self._motion_threshold
 
     def run(self):
         last_inf = 0.0
@@ -329,17 +338,6 @@ class InferenceWorker(threading.Thread):
                 small_h = max(8, int(frame_bgr.shape[0] * self.mask_downscale))
                 self._ensure_cached_params(small_h, small_w)
 
-                small_gray = cv2.resize(frame_bgr, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
-                small_gray = cv2.cvtColor(small_gray, cv2.COLOR_BGR2GRAY)
-
-                if not self._motion_gate(small_gray):
-                    with self.out_lock:
-                        if self.latest_result is not None:
-                            self.latest_result['bgr'] = frame_bgr
-                            self.latest_result['ts'] = time.time()
-                    last_inf = time.time()
-                    continue
-
                 if self.input_dtype == np.uint8:
                     np.copyto(self.input_tensor[0], resized_rgb, casting="unsafe")
                 else:
@@ -360,7 +358,7 @@ class InferenceWorker(threading.Thread):
                     final_bgr = frame_bgr
                     proc_dt = time.time() - ts0
                 else:
-                    _, mask_binary = cv2.threshold(small_mask, 127, 255, cv2.THRESH_BINARY)
+                    _, mask_binary = cv2.threshold(small_mask, 120, 255, cv2.THRESH_BINARY)
                     alpha_small = self._alpha_for(mask_binary)
                     alpha_map = cv2.resize(alpha_small, (frame_bgr.shape[1], frame_bgr.shape[0]),
                                            interpolation=cv2.INTER_LINEAR)
@@ -429,7 +427,7 @@ class InferenceWorker(threading.Thread):
                     boxes = det[:, :4] if det.shape[1] >= 4 else np.zeros((det.shape[0], 4))
                     mask_coeffs = det[:, -P:]
 
-                valid_idx = np.where(scores > 0.27)[0]
+                valid_idx = np.where(scores > 0.22)[0]
                 if valid_idx.size > 0:
                     scores_valid = scores[valid_idx]
                     order = np.argsort(scores_valid)[::-1][:MAX_ACTIVE_MASKS]
