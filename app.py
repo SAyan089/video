@@ -21,6 +21,7 @@ TFLITE_THREADS = max(1, multiprocessing.cpu_count() - 1)
 NAIL_COLOR = (199, 21, 133)
 NAIL_COLOR_BGR = NAIL_COLOR[::-1]
 TEXTURE_DEFAULT = 0.35
+MIN_CONTOUR = 60
 FEATHER_IN = 2
 FEATHER_OUT = 4
 MAX_OUT_ALPHA = 0.06
@@ -39,6 +40,8 @@ try:
     DEFAULT_CAM_BACKEND = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_V4L2
 except AttributeError:
     DEFAULT_CAM_BACKEND = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
+
+_SMALL_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
 
 # ---------------- Helper functions ----------------
@@ -92,6 +95,22 @@ def add_natural_sheen(img_bgr, hard_mask, intensity=0.04):
     g3 = np.stack([g, g, g], axis=2)
     out = img_bgr.astype(np.float32) * (1 - g3) + 255.0 * g3
     return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def refine_small_mask(mask_small, min_area=30):
+    if mask_small.sum() == 0:
+        return mask_small
+    m = cv2.morphologyEx(mask_small, cv2.MORPH_CLOSE, _SMALL_KERNEL, iterations=1)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, _SMALL_KERNEL, iterations=1)
+    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    refined = np.zeros_like(mask_small)
+    for c in contours:
+        if cv2.contourArea(c) < min_area:
+            continue
+        cv2.fillPoly(refined, [c], 255)
+    if refined.sum() == 0:
+        refined = m
+    return refined
 
 
 # ---------------- TFLite helpers ----------------
@@ -273,6 +292,8 @@ class InferenceWorker(threading.Thread):
         self._alpha_kernel_out = None
         self._alpha_cache_mask = None
         self._alpha_cache = None
+        self._min_area_small = max(15, int(MIN_CONTOUR * (self.mask_downscale ** 2)))
+        self._debug_printed = False
 
     def _ensure_cached_params(self, small_h, small_w):
         dilate = max(1, int(self.mask_downscale * DILATION_PIXELS * 2) | 1)
@@ -288,6 +309,7 @@ class InferenceWorker(threading.Thread):
         if self._alpha_cache_mask is not None and self._alpha_cache_mask.shape != (small_h, small_w):
             self._alpha_cache_mask = None
             self._alpha_cache = None
+        self._min_area_small = max(12, int(MIN_CONTOUR * (self.mask_downscale ** 2)))
 
     def _alpha_for(self, mask_small):
         if self._alpha_cache_mask is not None and self._alpha_cache_mask.shape != mask_small.shape:
@@ -351,6 +373,11 @@ class InferenceWorker(threading.Thread):
                 outputs = [self.interpreter.get_tensor(od["index"]) for od in self.output_details]
                 inf_dt = time.time() - inf_start
 
+                if not self._debug_printed:
+                    shapes = [(o.shape, str(o.dtype)) for o in outputs]
+                    print(f"[Worker] output tensors: {shapes}")
+                    self._debug_printed = True
+
                 self.det_idx, self.proto_idx = _resolve_mask_outputs(outputs, self.det_idx, self.proto_idx)
 
                 small_mask = self._build_small_mask(outputs, small_h, small_w)
@@ -358,7 +385,10 @@ class InferenceWorker(threading.Thread):
                     final_bgr = frame_bgr
                     proc_dt = time.time() - ts0
                 else:
-                    _, mask_binary = cv2.threshold(small_mask, 120, 255, cv2.THRESH_BINARY)
+                    _, mask_binary = cv2.threshold(small_mask, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+                    mask_binary = refine_small_mask(mask_binary, self._min_area_small)
+                    if self._dilate_kernel is not None:
+                        mask_binary = cv2.dilate(mask_binary, self._dilate_kernel, iterations=1)
                     alpha_small = self._alpha_for(mask_binary)
                     alpha_map = cv2.resize(alpha_small, (frame_bgr.shape[1], frame_bgr.shape[0]),
                                            interpolation=cv2.INTER_LINEAR)
@@ -427,7 +457,7 @@ class InferenceWorker(threading.Thread):
                     boxes = det[:, :4] if det.shape[1] >= 4 else np.zeros((det.shape[0], 4))
                     mask_coeffs = det[:, -P:]
 
-                valid_idx = np.where(scores > 0.22)[0]
+                valid_idx = np.where(scores > 0.12)[0]
                 if valid_idx.size > 0:
                     scores_valid = scores[valid_idx]
                     order = np.argsort(scores_valid)[::-1][:MAX_ACTIVE_MASKS]
@@ -501,7 +531,23 @@ class InferenceWorker(threading.Thread):
                 mask_small = cv2.resize(m, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
                 mask_small = np.clip(mask_small * 255.0, 0, 255).astype(np.uint8)
                 fallback = np.maximum(fallback, mask_small)
-        return fallback if fallback.any() else None
+        if fallback.any():
+            return fallback
+
+        for o in outputs:
+            arr = np.squeeze(o)
+            if arr.ndim != 2:
+                continue
+            arr = arr.astype(np.float32)
+            arr -= arr.min()
+            max_val = arr.max()
+            if max_val < 1e-6:
+                continue
+            arr = (arr / max_val) * 255.0
+            arr = cv2.resize(arr.astype(np.uint8), (small_w, small_h), interpolation=cv2.INTER_LINEAR)
+            if arr.any():
+                return arr
+        return None
 
     def get_latest(self):
         with self.out_lock:
