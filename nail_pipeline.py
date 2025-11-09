@@ -26,6 +26,7 @@ FEATHER_IN = 3
 FEATHER_OUT = 6
 MAX_OUT_ALPHA = 0.08
 MASK_DOWNSCALE = 0.5
+MASK_REUSE_THRESHOLD = 0.05
 
 
 cv2.setUseOptimized(True)
@@ -203,11 +204,35 @@ def add_natural_sheen(img_rgb, hard_mask, intensity=0.06,
 
 
 # ---------------- TFLite helpers ----------------
+def _try_load_delegate(lib_name):
+    try:
+        return tf.lite.experimental.load_delegate(lib_name)
+    except Exception:
+        return None
+
+
 def load_tflite_interpreter(path, num_threads=TFLITE_THREADS):
     if not os.path.exists(path):
         raise FileNotFoundError(f"TFLite model not found at: {path}")
 
-    interpreter = tf.lite.Interpreter(model_path=path, num_threads=num_threads)
+    delegates = []
+    for lib in ("libtensorflowlite_gpu_delegate.so", "libtensorflowlite_delegate_xnnpack.so",
+                "libtensorflowlite_xnnpack_delegate.so"):
+        delegate = _try_load_delegate(lib)
+        if delegate is not None:
+            delegates.append(delegate)
+            print(f"Loaded delegate: {lib}")
+            break
+
+    try:
+        interpreter = tf.lite.Interpreter(
+            model_path=path,
+            num_threads=num_threads,
+            experimental_delegates=delegates if delegates else None
+        )
+    except ValueError:
+        interpreter = tf.lite.Interpreter(model_path=path, num_threads=num_threads)
+
     interpreter.allocate_tensors()
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
@@ -326,6 +351,12 @@ class InferenceWorker(threading.Thread):
         self._sheen_map = None
         self._gloss_buffer = None
         self._sheen_work = None
+        self._prev_small_mask = None
+        self._prev_alpha_map = None
+        self._prev_refined_up = None
+        self._prev_output_rgb = None
+        self._prev_has_valid = False
+        self._last_render_params = None
 
     def _ensure_frame_buffers(self, H, W):
         if self._frame_shape == (H, W):
@@ -348,6 +379,12 @@ class InferenceWorker(threading.Thread):
         self._sheen_map = np.zeros((H, W), dtype=np.float32)
         self._gloss_buffer = np.zeros((H, W), dtype=np.uint8)
         self._sheen_work = np.zeros((H, W, 3), dtype=np.float32)
+        self._prev_small_mask = np.zeros((small_h, small_w), dtype=np.uint8)
+        self._prev_alpha_map = np.zeros((H, W), dtype=np.float32)
+        self._prev_refined_up = np.zeros((H, W), dtype=np.uint8)
+        self._prev_output_rgb = np.zeros((H, W, 3), dtype=np.uint8)
+        self._prev_has_valid = False
+        self._last_render_params = None
 
     def submit(self, frame_bgr):
         if frame_bgr is None:
@@ -487,60 +524,107 @@ class InferenceWorker(threading.Thread):
                     np.copyto(output_buf, frame_rgb, casting='unsafe')
                     final_rgb = output_buf
                     proc_dt = time.time() - ts0
+                    self._prev_has_valid = False
+                    self._last_render_params = None
                 else:
                     small_mask = self._small_mask
                     cv2.resize(combined_mask, (small_mask.shape[1], small_mask.shape[0]),
                                dst=small_mask, interpolation=cv2.INTER_LINEAR)
-                    _, small_mask = cv2.threshold(small_mask, 127, 255, cv2.THRESH_BINARY)
+                    cv2.threshold(small_mask, 127, 255, cv2.THRESH_BINARY, dst=small_mask)
 
-                    refined_small_arr = refine_nail_mask(
-                        small_mask,
-                        min_area=self._min_area_scaled,
-                        kernel=_SMALL_KERNEL
-                    )
-                    np.copyto(self._refined_small, refined_small_arr, casting='unsafe')
-                    refined_small = self._refined_small
-
-                    cv2.dilate(refined_small, self._dilate_kernel, dst=refined_small, iterations=1)
-
-                    alpha_small = create_feathered_alpha(
-                        refined_small,
-                        inner_feather=self._inner_feather,
-                        outer_feather=self._outer_feather,
-                        max_out_alpha=MAX_OUT_ALPHA,
-                        out_buffer=self._alpha_small
-                    )
-
-                    alpha_map = self._alpha_map
-                    cv2.resize(alpha_small, (W, H), dst=alpha_map, interpolation=cv2.INTER_LINEAR)
-
-                    colorize_nail_texture(
-                        frame_rgb,
-                        alpha_map,
+                    render_params = (
                         InferenceWorker.shared_color_rgb,
-                        texture_strength=InferenceWorker.shared_texture,
-                        brightness_adjust=1.05,
-                        out=output_buf,
-                        work_f32=self._work_f32,
-                        blend_f32=self._blend_f32,
-                        gray_u8=self._gray_u8
+                        round(float(InferenceWorker.shared_texture), 4),
+                        bool(InferenceWorker.shared_sheen),
+                        round(float(InferenceWorker.shared_sheen_intensity), 4)
                     )
+                    reuse_output_only = False
+                    reuse_mask_only = False
+                    if self._prev_has_valid:
+                        diff = cv2.absdiff(small_mask, self._prev_small_mask)
+                        changed_pixels = cv2.countNonZero(diff)
+                        prev_pixels = cv2.countNonZero(self._prev_small_mask)
+                        current_pixels = cv2.countNonZero(small_mask)
+                        denom = float(max(prev_pixels, current_pixels, 1))
+                        change_ratio = changed_pixels / denom
+                        if change_ratio <= MASK_REUSE_THRESHOLD:
+                            if render_params == self._last_render_params:
+                                reuse_output_only = True
+                            else:
+                                reuse_mask_only = True
 
-                    if InferenceWorker.shared_sheen:
-                        refined_up = self._refined_up
-                        cv2.resize(refined_small, (W, H), dst=refined_up, interpolation=cv2.INTER_NEAREST)
-                        add_natural_sheen(
-                            output_buf,
-                            refined_up,
-                            intensity=InferenceWorker.shared_sheen_intensity,
-                            gloss_buffer=self._gloss_buffer,
-                            sheen_map=self._sheen_map,
-                            work_f32=self._sheen_work,
-                            out=output_buf
+                    if reuse_output_only:
+                        np.copyto(output_buf, self._prev_output_rgb, casting='unsafe')
+                        final_rgb = output_buf
+                        proc_dt = time.time() - ts0
+                    else:
+                        if not reuse_mask_only:
+                            refined_small_arr = refine_nail_mask(
+                                small_mask,
+                                min_area=self._min_area_scaled,
+                                kernel=_SMALL_KERNEL
+                            )
+                            np.copyto(self._refined_small, refined_small_arr, casting='unsafe')
+                            refined_small = self._refined_small
+
+                            cv2.dilate(refined_small, self._dilate_kernel, dst=refined_small, iterations=1)
+
+                            alpha_small = create_feathered_alpha(
+                                refined_small,
+                                inner_feather=self._inner_feather,
+                                outer_feather=self._outer_feather,
+                                max_out_alpha=MAX_OUT_ALPHA,
+                                out_buffer=self._alpha_small
+                            )
+
+                            alpha_map = self._alpha_map
+                            cv2.resize(alpha_small, (W, H), dst=alpha_map, interpolation=cv2.INTER_LINEAR)
+
+                            refined_up = self._refined_up
+                            cv2.resize(refined_small, (W, H), dst=refined_up, interpolation=cv2.INTER_NEAREST)
+
+                            np.copyto(self._prev_small_mask, small_mask, casting='unsafe')
+                            np.copyto(self._prev_alpha_map, alpha_map, casting='unsafe')
+                            np.copyto(self._prev_refined_up, refined_up, casting='unsafe')
+                        else:
+                            alpha_map = self._alpha_map
+                            np.copyto(alpha_map, self._prev_alpha_map, casting='unsafe')
+                            if InferenceWorker.shared_sheen:
+                                refined_up = self._refined_up
+                                np.copyto(refined_up, self._prev_refined_up, casting='unsafe')
+                            else:
+                                self._refined_up.fill(0)
+
+                        alpha_map = self._alpha_map
+                        colorize_nail_texture(
+                            frame_rgb,
+                            alpha_map,
+                            InferenceWorker.shared_color_rgb,
+                            texture_strength=InferenceWorker.shared_texture,
+                            brightness_adjust=1.05,
+                            out=output_buf,
+                            work_f32=self._work_f32,
+                            blend_f32=self._blend_f32,
+                            gray_u8=self._gray_u8
                         )
 
-                    final_rgb = output_buf
-                    proc_dt = time.time() - ts0
+                        if InferenceWorker.shared_sheen:
+                            refined_up = self._refined_up
+                            add_natural_sheen(
+                                output_buf,
+                                refined_up,
+                                intensity=InferenceWorker.shared_sheen_intensity,
+                                gloss_buffer=self._gloss_buffer,
+                                sheen_map=self._sheen_map,
+                                work_f32=self._sheen_work,
+                                out=output_buf
+                            )
+
+                        final_rgb = output_buf
+                        proc_dt = time.time() - ts0
+                        np.copyto(self._prev_output_rgb, output_buf, casting='unsafe')
+                        self._prev_has_valid = True
+                        self._last_render_params = render_params
 
                 with self.out_lock:
                     self.latest_result = {
