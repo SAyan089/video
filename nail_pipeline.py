@@ -1,10 +1,12 @@
 import argparse
 import os
+import sys
 import time
 import threading
 import queue
 import traceback
 import multiprocessing
+import ctypes.util
 
 import cv2
 import numpy as np
@@ -258,11 +260,42 @@ def add_natural_sheen(img_rgb, hard_mask, intensity=0.06,
 
 
 # ---------------- TFLite helpers ----------------
-def _try_load_delegate(lib_name):
-    try:
-        return tf.lite.experimental.load_delegate(lib_name)
-    except Exception:
-        return None
+def _resolve_delegate_paths():
+    if os.environ.get("NAIL_DISABLE_DELEGATES", "").strip():
+        return []
+
+    candidates = []
+    platform = sys.platform
+    if platform.startswith("win"):
+        base_names = [
+            "tensorflowlite_gpu_delegate",
+            "tensorflowlite_xnnpack_delegate",
+        ]
+        ext = ".dll"
+    elif platform == "darwin":
+        base_names = [
+            "tensorflowlite_gpu_delegate",
+            "tensorflowlite_xnnpack_delegate",
+        ]
+        ext = ".dylib"
+    else:
+        base_names = [
+            "tensorflowlite_gpu_delegate",
+            "tensorflowlite_delegate_xnnpack",
+            "tensorflowlite_xnnpack_delegate",
+        ]
+        ext = ".so"
+
+    for base in base_names:
+        resolved = ctypes.util.find_library(base)
+        if resolved:
+            candidates.append(resolved)
+        else:
+            tf_dir = os.path.dirname(tf.__file__)
+            guess = os.path.join(tf_dir, base + ext)
+            if os.path.isfile(guess):
+                candidates.append(guess)
+    return candidates
 
 
 def load_tflite_interpreter(path, num_threads=TFLITE_THREADS):
@@ -270,13 +303,15 @@ def load_tflite_interpreter(path, num_threads=TFLITE_THREADS):
         raise FileNotFoundError(f"TFLite model not found at: {path}")
 
     delegates = []
-    for lib in ("libtensorflowlite_gpu_delegate.so", "libtensorflowlite_delegate_xnnpack.so",
-                "libtensorflowlite_xnnpack_delegate.so"):
-        delegate = _try_load_delegate(lib)
-        if delegate is not None:
+    for lib_path in _resolve_delegate_paths():
+        try:
+            delegate = tf.lite.experimental.load_delegate(lib_path)
             delegates.append(delegate)
-            print(f"Loaded delegate: {lib}")
+            print(f"Loaded delegate: {lib_path}")
             break
+        except (ValueError, OSError) as exc:
+            print(f"Warning: failed to load delegate '{lib_path}': {exc}")
+            continue
 
     try:
         interpreter = tf.lite.Interpreter(
@@ -284,6 +319,8 @@ def load_tflite_interpreter(path, num_threads=TFLITE_THREADS):
             num_threads=num_threads,
             experimental_delegates=delegates if delegates else None
         )
+        if delegates:
+            interpreter._custom_delegates = delegates  # keep references alive
     except ValueError:
         interpreter = tf.lite.Interpreter(model_path=path, num_threads=num_threads)
 
