@@ -25,8 +25,11 @@ DILATION_PIXELS = 4
 FEATHER_IN = 3
 FEATHER_OUT = 6
 MAX_OUT_ALPHA = 0.08
-MASK_DOWNSCALE = 0.5
-MASK_REUSE_THRESHOLD = 0.05
+MASK_DOWNSCALE = 0.35
+CAPTURE_WIDTH = 480
+CAPTURE_HEIGHT = 360
+ROI_PADDING = 8
+MASK_REUSE_THRESHOLD = 0.10
 
 
 cv2.setUseOptimized(True)
@@ -126,68 +129,118 @@ def create_feathered_alpha(mask, inner_feather=3, outer_feather=6, max_out_alpha
 
 
 def colorize_nail_texture(orig_rgb, alpha, color_rgb, texture_strength=0.35, brightness_adjust=1.0,
-                          out=None, work_f32=None, blend_f32=None, gray_u8=None):
+                          out=None, work_f32=None, blend_f32=None, gray_u8=None, bbox=None):
+    h, w = orig_rgb.shape[:2]
+    if bbox is None:
+        x1, y1, x2, y2 = 0, 0, w, h
+    else:
+        x1, y1, x2, y2 = bbox
+        x1 = max(0, min(w, x1))
+        x2 = max(x1, min(w, x2))
+        y1 = max(0, min(h, y1))
+        y2 = max(y1, min(h, y2))
+
+    orig_roi = orig_rgb[y1:y2, x1:x2]
+    alpha_roi = alpha[y1:y2, x1:x2]
+
     if out is None or out.shape != orig_rgb.shape:
         out = np.empty_like(orig_rgb)
-    if work_f32 is None or work_f32.shape != orig_rgb.shape:
-        work_f32 = np.empty_like(orig_rgb, dtype=np.float32)
-    if blend_f32 is None or blend_f32.shape != orig_rgb.shape:
-        blend_f32 = np.empty_like(orig_rgb, dtype=np.float32)
+    out_roi = out[y1:y2, x1:x2]
 
-    np.multiply(orig_rgb, brightness_adjust, out=work_f32, casting='unsafe')
-    if gray_u8 is None or gray_u8.shape != orig_rgb.shape[:2]:
-        gray = cv2.cvtColor(orig_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    if alpha_roi.size == 0 or not np.any(alpha_roi > 1e-3):
+        np.copyto(out_roi, orig_roi, casting='unsafe')
+        return out
+
+    if work_f32 is None or work_f32.shape != orig_rgb.shape:
+        work_roi = orig_roi.astype(np.float32)
+        if brightness_adjust != 1.0:
+            work_roi *= brightness_adjust
     else:
-        cv2.cvtColor(orig_rgb, cv2.COLOR_RGB2GRAY, dst=gray_u8)
-        gray = gray_u8.astype(np.float32) / 255.0
+        work_roi = work_f32[y1:y2, x1:x2]
+        np.multiply(orig_roi, brightness_adjust, out=work_roi, casting='unsafe')
+
+    if blend_f32 is None or blend_f32.shape != orig_rgb.shape:
+        blend_roi = np.empty_like(orig_roi, dtype=np.float32)
+    else:
+        blend_roi = blend_f32[y1:y2, x1:x2]
+
+    if gray_u8 is None or gray_u8.shape != orig_rgb.shape[:2]:
+        gray = cv2.cvtColor(orig_roi, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    else:
+        gray_roi = gray_u8[y1:y2, x1:x2]
+        cv2.cvtColor(orig_roi, cv2.COLOR_RGB2GRAY, dst=gray_roi)
+        gray = gray_roi.astype(np.float32) / 255.0
 
     highlights = np.sqrt(gray, dtype=np.float32)
     color = np.asarray(color_rgb, dtype=np.float32).reshape(1, 1, 3)
-    np.multiply(work_f32, texture_strength, out=blend_f32)
-    blend_f32 += color * (1.0 - texture_strength)
+    np.multiply(work_roi, texture_strength, out=blend_roi)
+    blend_roi += color * (1.0 - texture_strength)
     highlight_boost = highlights[:, :, None] * 0.2
-    blend_f32 *= (1 + highlight_boost)
+    blend_roi *= (1 + highlight_boost)
 
-    alpha_3 = alpha[:, :, None]
-    np.multiply(work_f32, (1.0 - alpha_3), out=work_f32)
-    np.multiply(blend_f32, alpha_3, out=blend_f32)
-    np.add(work_f32, blend_f32, out=blend_f32)
-    np.clip(blend_f32, 0, 255, out=blend_f32)
-    np.rint(blend_f32, out=blend_f32)
-    np.copyto(out, blend_f32.astype(np.uint8), casting='unsafe')
+    alpha_3 = alpha_roi[:, :, None]
+    np.multiply(work_roi, (1.0 - alpha_3), out=work_roi)
+    np.multiply(blend_roi, alpha_3, out=blend_roi)
+    np.add(work_roi, blend_roi, out=blend_roi)
+    np.clip(blend_roi, 0, 255, out=blend_roi)
+    np.rint(blend_roi, out=blend_roi)
+    np.copyto(out_roi, blend_roi.astype(np.uint8), casting='unsafe')
     return out
 
 
 def add_natural_sheen(img_rgb, hard_mask, intensity=0.06,
-                      gloss_buffer=None, sheen_map=None, work_f32=None, out=None):
-    if gloss_buffer is None or gloss_buffer.shape != hard_mask.shape:
-        gloss = np.zeros(hard_mask.shape, dtype=np.uint8)
+                      gloss_buffer=None, sheen_map=None, work_f32=None, out=None, bbox=None):
+    h, w = hard_mask.shape[:2]
+    if bbox is None:
+        x1, y1, x2, y2 = 0, 0, w, h
     else:
-        gloss = gloss_buffer
+        x1, y1, x2, y2 = bbox
+        x1 = max(0, min(w, x1))
+        x2 = max(x1, min(w, x2))
+        y1 = max(0, min(h, y1))
+        y2 = max(y1, min(h, y2))
+
+    mask_roi = hard_mask[y1:y2, x1:x2]
+    img_roi = img_rgb[y1:y2, x1:x2]
+
+    if mask_roi.size == 0 or cv2.countNonZero(mask_roi) == 0:
+        if out is None or out.shape != img_rgb.shape:
+            out_frame = np.empty_like(img_rgb)
+        else:
+            out_frame = out
+        out_roi = out_frame[y1:y2, x1:x2]
+        np.copyto(out_roi, img_roi, casting='unsafe')
+        return out_frame
+
+    if gloss_buffer is None or gloss_buffer.shape != hard_mask.shape:
+        gloss = np.zeros(mask_roi.shape, dtype=np.uint8)
+    else:
+        gloss = gloss_buffer[y1:y2, x1:x2]
         gloss.fill(0)
-    contours, _ = cv2.findContours(hard_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(mask_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for c in contours:
         area = cv2.contourArea(c)
         if area < 100:
             continue
-        x, y, w, h = cv2.boundingRect(c)
-        cx = x + int(w * 0.4)
-        cy = y + int(h * 0.25)
-        rx = max(1, int(w * 0.35))
-        ry = max(1, int(h * 0.15))
+        x, y, w_box, h_box = cv2.boundingRect(c)
+        cx = x + int(w_box * 0.4)
+        cy = y + int(h_box * 0.25)
+        rx = max(1, int(w_box * 0.35))
+        ry = max(1, int(h_box * 0.15))
         cv2.ellipse(gloss, (cx, cy), (rx, ry), 0, 0, 360, 255, -1)
 
     if sheen_map is None or sheen_map.shape != hard_mask.shape:
         g = gloss.astype(np.float32) * (intensity / 255.0)
     else:
-        np.multiply(gloss, intensity / 255.0, out=sheen_map, casting='unsafe')
-        g = sheen_map
+        g_roi = sheen_map[y1:y2, x1:x2]
+        np.multiply(gloss, intensity / 255.0, out=g_roi, casting='unsafe')
+        g = g_roi
 
     if work_f32 is None or work_f32.shape != img_rgb.shape:
-        work = img_rgb.astype(np.float32)
+        work = img_roi.astype(np.float32)
     else:
-        np.copyto(work_f32, img_rgb, casting='unsafe')
-        work = work_f32
+        work = work_f32[y1:y2, x1:x2]
+        np.copyto(work, img_roi, casting='unsafe')
 
     g_expanded = g[:, :, None]
     work *= (1.0 - g_expanded)
@@ -197,9 +250,10 @@ def add_natural_sheen(img_rgb, hard_mask, intensity=0.06,
         out_frame = np.empty_like(img_rgb)
     else:
         out_frame = out
+    out_roi = out_frame[y1:y2, x1:x2]
     np.clip(work, 0, 255, out=work)
     np.rint(work, out=work)
-    np.copyto(out_frame, work.astype(np.uint8), casting='unsafe')
+    np.copyto(out_roi, work.astype(np.uint8), casting='unsafe')
     return out_frame
 
 
@@ -249,7 +303,7 @@ def _resolve_mask_outputs(outputs, cached_det_idx, cached_proto_idx):
 
 # ---------------- Video reader thread ----------------
 class CameraReader(threading.Thread):
-    def __init__(self, src=0, width=640, height=480):
+    def __init__(self, src=0, width=CAPTURE_WIDTH, height=CAPTURE_HEIGHT):
         super().__init__(daemon=True)
         self.cap = cv2.VideoCapture(src, cv2.CAP_DSHOW)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
@@ -357,6 +411,7 @@ class InferenceWorker(threading.Thread):
         self._prev_output_rgb = None
         self._prev_has_valid = False
         self._last_render_params = None
+        self._prev_bbox = None
 
     def _ensure_frame_buffers(self, H, W):
         if self._frame_shape == (H, W):
@@ -385,6 +440,7 @@ class InferenceWorker(threading.Thread):
         self._prev_output_rgb = np.zeros((H, W, 3), dtype=np.uint8)
         self._prev_has_valid = False
         self._last_render_params = None
+        self._prev_bbox = None
 
     def submit(self, frame_bgr):
         if frame_bgr is None:
@@ -526,6 +582,7 @@ class InferenceWorker(threading.Thread):
                     proc_dt = time.time() - ts0
                     self._prev_has_valid = False
                     self._last_render_params = None
+                    self._prev_bbox = None
                 else:
                     small_mask = self._small_mask
                     cv2.resize(combined_mask, (small_mask.shape[1], small_mask.shape[0]),
@@ -589,42 +646,57 @@ class InferenceWorker(threading.Thread):
                         else:
                             alpha_map = self._alpha_map
                             np.copyto(alpha_map, self._prev_alpha_map, casting='unsafe')
-                            if InferenceWorker.shared_sheen:
-                                refined_up = self._refined_up
-                                np.copyto(refined_up, self._prev_refined_up, casting='unsafe')
-                            else:
-                                self._refined_up.fill(0)
+                            refined_up = self._refined_up
+                            np.copyto(refined_up, self._prev_refined_up, casting='unsafe')
 
                         alpha_map = self._alpha_map
-                        colorize_nail_texture(
-                            frame_rgb,
-                            alpha_map,
-                            InferenceWorker.shared_color_rgb,
-                            texture_strength=InferenceWorker.shared_texture,
-                            brightness_adjust=1.05,
-                            out=output_buf,
-                            work_f32=self._work_f32,
-                            blend_f32=self._blend_f32,
-                            gray_u8=self._gray_u8
-                        )
+                        refined_up = self._refined_up
+                        if not reuse_mask_only or self._prev_bbox is None:
+                            bbox = self._compute_bbox(refined_up, ROI_PADDING, W, H)
+                        else:
+                            bbox = self._prev_bbox
 
-                        if InferenceWorker.shared_sheen:
-                            refined_up = self._refined_up
-                            add_natural_sheen(
-                                output_buf,
-                                refined_up,
-                                intensity=InferenceWorker.shared_sheen_intensity,
-                                gloss_buffer=self._gloss_buffer,
-                                sheen_map=self._sheen_map,
-                                work_f32=self._sheen_work,
-                                out=output_buf
+                        if bbox is None:
+                            np.copyto(output_buf, frame_rgb, casting='unsafe')
+                            final_rgb = output_buf
+                            proc_dt = time.time() - ts0
+                            self._prev_has_valid = False
+                            self._last_render_params = None
+                            self._prev_bbox = None
+                        else:
+                            np.copyto(output_buf, frame_rgb, casting='unsafe')
+                            colorize_nail_texture(
+                                frame_rgb,
+                                alpha_map,
+                                InferenceWorker.shared_color_rgb,
+                                texture_strength=InferenceWorker.shared_texture,
+                                brightness_adjust=1.05,
+                                out=output_buf,
+                                work_f32=self._work_f32,
+                                blend_f32=self._blend_f32,
+                                gray_u8=self._gray_u8,
+                                bbox=bbox
                             )
 
-                        final_rgb = output_buf
-                        proc_dt = time.time() - ts0
-                        np.copyto(self._prev_output_rgb, output_buf, casting='unsafe')
-                        self._prev_has_valid = True
-                        self._last_render_params = render_params
+                            if InferenceWorker.shared_sheen:
+                                refined_up = self._refined_up
+                                add_natural_sheen(
+                                    output_buf,
+                                    refined_up,
+                                    intensity=InferenceWorker.shared_sheen_intensity,
+                                    gloss_buffer=self._gloss_buffer,
+                                    sheen_map=self._sheen_map,
+                                    work_f32=self._sheen_work,
+                                    out=output_buf,
+                                    bbox=bbox
+                                )
+
+                            final_rgb = output_buf
+                            proc_dt = time.time() - ts0
+                            np.copyto(self._prev_output_rgb, output_buf, casting='unsafe')
+                            self._prev_has_valid = True
+                            self._last_render_params = render_params
+                            self._prev_bbox = bbox
 
                 with self.out_lock:
                     self.latest_result = {
@@ -676,6 +748,19 @@ class InferenceWorker(threading.Thread):
             return fallback
         return None
 
+    def _compute_bbox(self, mask, pad, W, H):
+        points = cv2.findNonZero(mask)
+        if points is None:
+            return None
+        x, y, w_box, h_box = cv2.boundingRect(points)
+        x1 = max(0, x - pad)
+        y1 = max(0, y - pad)
+        x2 = min(W, x + w_box + pad)
+        y2 = min(H, y + h_box + pad)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return (x1, y1, x2, y2)
+
 
 def parse_tflite_outputs(outputs):
     det_idx = None
@@ -716,7 +801,8 @@ def parse_tflite_outputs(outputs):
 # ---------------- Main processing ----------------
 def run_live(model_path, cam_index=0, desired_fps=DESIRED_FPS, color_hex="#c71585",
              add_sheen=False, sheen_intensity=0.06, texture_amt=TEXTURE_DEFAULT,
-             infer_fps=INFER_FPS, mask_downscale=MASK_DOWNSCALE):
+             infer_fps=INFER_FPS, mask_downscale=MASK_DOWNSCALE,
+             capture_width=CAPTURE_WIDTH, capture_height=CAPTURE_HEIGHT):
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"TFLite model not found at: {model_path}")
 
@@ -737,7 +823,7 @@ def run_live(model_path, cam_index=0, desired_fps=DESIRED_FPS, color_hex="#c7158
     InferenceWorker.shared_sheen = bool(add_sheen)
     InferenceWorker.shared_sheen_intensity = float(sheen_intensity)
 
-    reader = CameraReader(src=cam_index, width=640, height=480)
+    reader = CameraReader(src=cam_index, width=capture_width, height=capture_height)
     reader.start()
 
     worker = InferenceWorker(
@@ -820,6 +906,8 @@ if __name__ == "__main__":
     ap.add_argument("--infer_fps", type=float, default=INFER_FPS, help="Max inference FPS (lower => faster UI).")
     ap.add_argument("--mask_downscale", type=float, default=MASK_DOWNSCALE,
                     help="Run heavy mask ops on downscaled mask (0.3-1.0).")
+    ap.add_argument("--capture_w", type=int, default=CAPTURE_WIDTH, help="Camera capture width.")
+    ap.add_argument("--capture_h", type=int, default=CAPTURE_HEIGHT, help="Camera capture height.")
     args = ap.parse_args()
 
     run_live(
@@ -831,5 +919,7 @@ if __name__ == "__main__":
         sheen_intensity=args.sheen_int,
         texture_amt=args.texture,
         infer_fps=args.infer_fps,
-        mask_downscale=args.mask_downscale
+        mask_downscale=args.mask_downscale,
+        capture_width=args.capture_w,
+        capture_height=args.capture_h
     )
