@@ -205,7 +205,6 @@ class InferenceWorker(threading.Thread):
         )
         self.input_detail = input_details[0]
         self.output_details = output_details
-        self._output_accessors = [self.interpreter.tensor(od['index']) for od in output_details]
 
         input_shape = self.input_detail['shape']
         if len(input_shape) != 4:
@@ -299,12 +298,33 @@ class InferenceWorker(threading.Thread):
                 inf_start = time.time()
                 self.interpreter.set_tensor(self.input_detail['index'], self.input_tensor)
                 self.interpreter.invoke()
-                outputs = [acc() for acc in self._output_accessors]
                 inf_dt = time.time() - inf_start
 
-                self.det_idx, self.proto_idx = _resolve_mask_outputs(
-                    outputs, self.det_idx, self.proto_idx
-                )
+                outputs_snapshot = None
+                proto = None
+                det = None
+
+                if self.det_idx is None or self.proto_idx is None:
+                    outputs_snapshot = [
+                        self.interpreter.get_tensor(od['index'])
+                        for od in self.output_details
+                    ]
+                    self.det_idx, self.proto_idx = _resolve_mask_outputs(
+                        outputs_snapshot, self.det_idx, self.proto_idx
+                    )
+                    if self.proto_idx is not None and self.proto_idx < len(outputs_snapshot):
+                        proto = outputs_snapshot[self.proto_idx]
+                    if self.det_idx is not None and self.det_idx < len(outputs_snapshot):
+                        det = outputs_snapshot[self.det_idx]
+                else:
+                    if self.proto_idx is not None:
+                        proto = self.interpreter.get_tensor(
+                            self.output_details[self.proto_idx]['index']
+                        )
+                    if self.det_idx is not None:
+                        det = self.interpreter.get_tensor(
+                            self.output_details[self.det_idx]['index']
+                        )
 
                 H, W = frame.shape[:2]
                 self._ensure_frame_buffers(H, W)
@@ -312,8 +332,7 @@ class InferenceWorker(threading.Thread):
                 combined_mask_in.fill(0)
                 combined_mask = None
 
-                if self.proto_idx is not None and self.det_idx is not None:
-                    proto = outputs[self.proto_idx]
+                if proto is not None and det is not None:
                     if proto.ndim == 4 and proto.shape[0] == 1:
                         proto = proto[0]
                     elif proto.ndim == 3 and proto.shape[0] == 1:
@@ -321,7 +340,6 @@ class InferenceWorker(threading.Thread):
                     if proto.ndim != 3:
                         proto = None
 
-                    det = outputs[self.det_idx]
                     if det.ndim == 3 and det.shape[0] == 1:
                         det = det[0]
                     if det.ndim == 2 and det.shape[0] < det.shape[1] and det.shape[0] <= 50:
@@ -392,7 +410,8 @@ class InferenceWorker(threading.Thread):
                                 combined_mask = mask_full
 
                 if combined_mask is None or not combined_mask.any():
-                    combined_mask = self._build_fallback_mask(outputs, H, W)
+                    combined_mask = self._build_fallback_mask(H, W, outputs_snapshot)
+                outputs_snapshot = None
 
                 if combined_mask is None or not combined_mask.any():
                     final_rgb = frame_rgb
@@ -465,9 +484,18 @@ class InferenceWorker(threading.Thread):
     def stop(self):
         self.running = False
 
-    def _build_fallback_mask(self, outputs, H, W):
-        combined = np.zeros((H, W), dtype=np.uint8)
-        for idx, o in enumerate(outputs):
+    def _build_fallback_mask(self, H, W, outputs_snapshot=None):
+        combined = self._mask_full_buffer
+        combined.fill(0)
+        if outputs_snapshot is None:
+            source_outputs = [
+                self.interpreter.get_tensor(od['index'])
+                for od in self.output_details
+            ]
+        else:
+            source_outputs = outputs_snapshot
+
+        for idx, o in enumerate(source_outputs):
             if idx in (self.proto_idx, self.det_idx):
                 continue
             candidate = None
